@@ -43,12 +43,10 @@ def main_keyboard():
 
 def list_keyboard(rows):
     buttons = []
-    for url_id, url, _ in rows:
-        short = url.replace("https://", "").replace("http://", "")
-        if len(short) > 35:
-            short = short[:35] + "…"
+    for url_id, url, title, _ in rows:
+        label = title if title else url.replace("https://", "").replace("http://", "")[:35]
         buttons.append([
-            InlineKeyboardButton(text=f"🔗 {short}", url=url),
+            InlineKeyboardButton(text=f"🔗 {label}", url=url),
             InlineKeyboardButton(text="🗑 Remove", callback_data=f"del:{url_id}"),
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -60,6 +58,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS urls (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 url       TEXT UNIQUE NOT NULL,
+                title     TEXT,
                 last_hash TEXT
             )
         """)
@@ -67,12 +66,14 @@ async def init_db():
 
 async def get_urls():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, url, last_hash FROM urls") as cur:
+        async with db.execute("SELECT id, url, title, last_hash FROM urls") as cur:
             return await cur.fetchall()
 
-async def add_url(url: str):
+async def add_url(url: str, title: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO urls (url) VALUES (?)", (url,))
+        await db.execute(
+            "INSERT OR IGNORE INTO urls (url, title) VALUES (?, ?)", (url, title)
+        )
         await db.commit()
 
 async def remove_url(url_id: int):
@@ -87,6 +88,19 @@ async def update_hash(url_id: int, new_hash: str):
 
 # ── Fetching ──────────────────────────────────────────────────────────────────
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebMonitor/1.0)"}
+
+async def fetch_title(session: aiohttp.ClientSession, url: str) -> str:
+    try:
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            html = await resp.text()
+            start = html.lower().find("<title>")
+            end = html.lower().find("</title>")
+            if start != -1 and end != -1:
+                title = html[start+7:end].strip()
+                return title[:50] if len(title) > 50 else title
+    except:
+        pass
+    return url.replace("https://", "").replace("http://", "")[:40]
 
 async def fetch_hash(session: aiohttp.ClientSession, url: str) -> str | None:
     try:
@@ -103,7 +117,7 @@ async def check_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             rows = await get_urls()
-            for url_id, url, last_hash in rows:
+            for url_id, url, title, last_hash in rows:
                 new_hash = await fetch_hash(session, url)
                 if new_hash is None:
                     continue
@@ -111,9 +125,12 @@ async def check_loop():
                     await update_hash(url_id, new_hash)
                 elif new_hash != last_hash:
                     await update_hash(url_id, new_hash)
+                    label = title if title else url
                     await bot.send_message(
                         ALLOWED_ID,
-                        f"🔔 <b>Change detected!</b>\n\n🔗 {url}",
+                        f"🔔 <b>Change detected!</b>\n\n"
+                        f"📄 {label}\n"
+                        f"🔗 {url}",
                         parse_mode="HTML"
                     )
             await asyncio.sleep(CHECK_EVERY)
@@ -166,10 +183,12 @@ async def receive_url(message: types.Message, state: FSMContext):
     if not url.startswith("http"):
         await message.answer("❌ That doesn't look like a URL. Try again:")
         return
-    await add_url(url)
+    async with aiohttp.ClientSession() as session:
+        title = await fetch_title(session, url)
+    await add_url(url, title)
     await state.clear()
     await message.answer(
-        f"✅ <b>Added!</b>\n\n🔗 {url}\n\nChecking every {CHECK_EVERY // 60} min.",
+        f"✅ <b>Added!</b>\n\n📄 {title}\n🔗 {url}\n\nChecking every {CHECK_EVERY // 60} min.",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -186,7 +205,7 @@ async def cmd_list(message: types.Message):
         )
         return
     await message.answer(
-        f"📋 <b>Monitoring {len(rows)} site(s):</b>\n\nTap 🗑 Remove to stop monitoring",
+        f"📋 <b>Monitoring {len(rows)} site(s):</b>",
         parse_mode="HTML",
         reply_markup=list_keyboard(rows),
     )

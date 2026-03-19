@@ -8,8 +8,6 @@ import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     InlineKeyboardButton,
@@ -28,9 +26,7 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-# ── FSM ───────────────────────────────────────────────────────────────────────
-class AddURL(StatesGroup):
-    waiting_for_url = State()
+
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def main_keyboard():
@@ -220,39 +216,13 @@ async def cmd_help(message: types.Message):
     )
 
 @dp.message(F.text == "➕ Add website")
-async def ask_url(message: types.Message, state: FSMContext):
+async def ask_url(message: types.Message):
     if not only_me(message): return
-    await state.set_state(AddURL.waiting_for_url)
     await message.answer(
-        "🔗 Send me the URL to monitor:\n\n<i>Example: https://example.com</i>",
-        parse_mode="HTML",
-        reply_markup=types.ReplyKeyboardRemove(),
-    )
-
-@dp.message(AddURL.waiting_for_url)
-async def receive_url(message: types.Message, state: FSMContext):
-    if not only_me(message): return
-    url = message.text.strip()
-    if not url.startswith("http"):
-        await message.answer("❌ That doesn't look like a URL. Try again:")
-        return
-
-    status_msg = await message.answer("🔍 Checking site...")
-
-    async with aiohttp.ClientSession() as session:
-        title = await fetch_title(session, url)
-
-    await add_url(url, title)
-    await state.clear()
-
-    await status_msg.edit_text(
-        f"✅ <b>Added!</b>\n\n"
-        f"📄 {title}\n"
-        f"🔗 {url}\n\n"
-        f"Checking every {CHECK_EVERY // 60} min.",
+        "🔗 Just send me any URL and I'll start monitoring it.\n\n"
+        "<i>Example: https://example.com</i>",
         parse_mode="HTML",
     )
-    await message.answer("What's next?", reply_markup=main_keyboard())
 
 @dp.message(F.text == "📋 My list")
 async def cmd_list(message: types.Message):
@@ -272,6 +242,22 @@ async def cmd_list(message: types.Message):
         f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}",
         parse_mode="HTML",
         reply_markup=list_keyboard(rows),
+    )
+
+@dp.message(F.text.startswith("http"))
+async def auto_add_url(message: types.Message):
+    if not only_me(message): return
+    url = message.text.strip()
+    status_msg = await message.answer("🔍 Checking site...")
+    async with aiohttp.ClientSession() as session:
+        title = await fetch_title(session, url)
+    await add_url(url, title)
+    await status_msg.edit_text(
+        f"✅ <b>Added!</b>\n\n"
+        f"📄 {title}\n"
+        f"🔗 {url}\n\n"
+        f"Checking every {CHECK_EVERY // 60} min.",
+        parse_mode="HTML",
     )
 
 @dp.callback_query(F.data.startswith("ask_del:"))

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from datetime import datetime
 
 import aiohttp
 import aiosqlite
@@ -43,13 +44,25 @@ def main_keyboard():
 
 def list_keyboard(rows):
     buttons = []
-    for url_id, url, title, _ in rows:
+    for url_id, url, title, _, is_up in rows:
         label = title if title else url.replace("https://", "").replace("http://", "")[:35]
+        status = "🟢" if is_up else "🔴"
         buttons.append([
-            InlineKeyboardButton(text=f"🔗 {label}", url=url),
-            InlineKeyboardButton(text="🗑 Remove", callback_data=f"del:{url_id}"),
+            InlineKeyboardButton(text=f"{status} {label}", url=url),
+            InlineKeyboardButton(text="🗑", callback_data=f"ask_del:{url_id}"),
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def confirm_delete_keyboard(url_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Yes, remove", callback_data=f"del:{url_id}"),
+        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_del"),
+    ]])
+
+def open_site_keyboard(url: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🌐 Open site", url=url),
+    ]])
 
 # ── Database ──────────────────────────────────────────────────────────────────
 async def init_db():
@@ -59,20 +72,21 @@ async def init_db():
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 url       TEXT UNIQUE NOT NULL,
                 title     TEXT,
-                last_hash TEXT
+                last_hash TEXT,
+                is_up     INTEGER DEFAULT 1
             )
         """)
         await db.commit()
 
 async def get_urls():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, url, title, last_hash FROM urls") as cur:
+        async with db.execute("SELECT id, url, title, last_hash, is_up FROM urls") as cur:
             return await cur.fetchall()
 
 async def add_url(url: str, title: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO urls (url, title) VALUES (?, ?)", (url, title)
+            "INSERT OR IGNORE INTO urls (url, title, is_up) VALUES (?, ?, 1)", (url, title)
         )
         await db.commit()
 
@@ -83,7 +97,14 @@ async def remove_url(url_id: int):
 
 async def update_hash(url_id: int, new_hash: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE urls SET last_hash = ? WHERE id = ?", (new_hash, url_id))
+        await db.execute(
+            "UPDATE urls SET last_hash = ?, is_up = 1 WHERE id = ?", (new_hash, url_id)
+        )
+        await db.commit()
+
+async def set_down(url_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE urls SET is_up = 0 WHERE id = ?", (url_id,))
         await db.commit()
 
 # ── Fetching ──────────────────────────────────────────────────────────────────
@@ -112,27 +133,50 @@ async def fetch_hash(session: aiohttp.ClientSession, url: str) -> str | None:
         return None
 
 # ── Background checker ────────────────────────────────────────────────────────
+fail_counts: dict[int, int] = {}
+
 async def check_loop():
     await asyncio.sleep(10)
     async with aiohttp.ClientSession() as session:
         while True:
             rows = await get_urls()
-            for url_id, url, title, last_hash in rows:
+            for url_id, url, title, last_hash, is_up in rows:
                 new_hash = await fetch_hash(session, url)
+                label = title if title else url
+
                 if new_hash is None:
+                    fail_counts[url_id] = fail_counts.get(url_id, 0) + 1
+                    if fail_counts[url_id] == 3 and is_up:
+                        await set_down(url_id)
+                        now = datetime.now().strftime("%d %b %Y, %H:%M")
+                        await bot.send_message(
+                            ALLOWED_ID,
+                            f"🔴 <b>Site is down!</b>\n\n"
+                            f"📄 {label}\n"
+                            f"🔗 {url}\n\n"
+                            f"🕐 {now}",
+                            parse_mode="HTML",
+                            reply_markup=open_site_keyboard(url),
+                        )
                     continue
+
+                fail_counts[url_id] = 0
+
                 if last_hash is None:
                     await update_hash(url_id, new_hash)
                 elif new_hash != last_hash:
                     await update_hash(url_id, new_hash)
-                    label = title if title else url
+                    now = datetime.now().strftime("%d %b %Y, %H:%M")
                     await bot.send_message(
                         ALLOWED_ID,
                         f"🔔 <b>Change detected!</b>\n\n"
                         f"📄 {label}\n"
-                        f"🔗 {url}",
-                        parse_mode="HTML"
+                        f"🔗 {url}\n\n"
+                        f"🕐 {now}",
+                        parse_mode="HTML",
+                        reply_markup=open_site_keyboard(url),
                     )
+
             await asyncio.sleep(CHECK_EVERY)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -143,6 +187,13 @@ def only_me(message: types.Message) -> bool:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if not only_me(message): return
+    # Uncomment and replace URL to show a welcome image:
+    # await message.answer_photo(
+    #     photo="https://i.imgur.com/yourimage.jpg",
+    #     caption="🌿 <b>Mzekali is watching.</b>...",
+    #     parse_mode="HTML",
+    #     reply_markup=main_keyboard(),
+    # )
     await message.answer(
         "🌿 <b>Mzekali is watching.</b>\n\n"
         "Named after the Georgian goddess of the forest — "
@@ -160,8 +211,10 @@ async def cmd_help(message: types.Message):
         "📖 <b>How to use:</b>\n\n"
         "➕ <b>Add website</b> — start monitoring a URL\n"
         "📋 <b>My list</b> — view all monitored sites\n"
-        "🗑 <b>Remove</b> — stop monitoring a site\n\n"
-        "I'll ping you the moment something changes 🔔",
+        "🟢 / 🔴 — site is up or down\n"
+        "🗑 — remove a site (asks for confirmation)\n\n"
+        "I'll ping you the moment something changes 🔔\n"
+        "I'll also alert you if a site goes down 🔴",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -183,15 +236,23 @@ async def receive_url(message: types.Message, state: FSMContext):
     if not url.startswith("http"):
         await message.answer("❌ That doesn't look like a URL. Try again:")
         return
+
+    status_msg = await message.answer("🔍 Checking site...")
+
     async with aiohttp.ClientSession() as session:
         title = await fetch_title(session, url)
+
     await add_url(url, title)
     await state.clear()
-    await message.answer(
-        f"✅ <b>Added!</b>\n\n📄 {title}\n🔗 {url}\n\nChecking every {CHECK_EVERY // 60} min.",
+
+    await status_msg.edit_text(
+        f"✅ <b>Added!</b>\n\n"
+        f"📄 {title}\n"
+        f"🔗 {url}\n\n"
+        f"Checking every {CHECK_EVERY // 60} min.",
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
     )
+    await message.answer("What's next?", reply_markup=main_keyboard())
 
 @dp.message(F.text == "📋 My list")
 async def cmd_list(message: types.Message):
@@ -204,23 +265,37 @@ async def cmd_list(message: types.Message):
             reply_markup=main_keyboard(),
         )
         return
+    up = sum(1 for r in rows if r[4])
+    down = len(rows) - up
+    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
     await message.answer(
-        f"📋 <b>Monitoring {len(rows)} site(s):</b>",
+        f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}",
         parse_mode="HTML",
         reply_markup=list_keyboard(rows),
     )
+
+@dp.callback_query(F.data.startswith("ask_del:"))
+async def ask_delete(callback: types.CallbackQuery):
+    if callback.from_user.id != ALLOWED_ID: return
+    url_id = int(callback.data.split(":")[1])
+    await callback.message.answer(
+        "🗑 Are you sure you want to remove this site?",
+        reply_markup=confirm_delete_keyboard(url_id),
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("del:"))
 async def delete_url(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
     url_id = int(callback.data.split(":")[1])
     await remove_url(url_id)
-    rows = await get_urls()
-    if not rows:
-        await callback.message.edit_text("📭 Your list is empty.")
-    else:
-        await callback.message.edit_reply_markup(reply_markup=list_keyboard(rows))
-    await callback.answer("🗑 Removed")
+    await callback.message.edit_text("🗑 Removed.")
+    await callback.answer("Done")
+
+@dp.callback_query(F.data == "cancel_del")
+async def cancel_delete(callback: types.CallbackQuery):
+    await callback.message.edit_text("👌 Cancelled.")
+    await callback.answer()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():

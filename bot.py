@@ -21,7 +21,7 @@ from aiogram.types import (
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
 ALLOWED_ID  = int(os.environ["ALLOWED_ID"])
-CHECK_EVERY = int(os.getenv("CHECK_EVERY", "300"))
+CHECK_EVERY = int(os.getenv("CHECK_EVERY", "3600"))
 DB_PATH     = os.getenv("DB_PATH", "monitor.db")
 TZ_OFFSET   = int(os.getenv("TZ_OFFSET", "0"))
 
@@ -235,50 +235,34 @@ async def check_loop():
     await asyncio.sleep(10)
     async with aiohttp.ClientSession() as session:
         while True:
+            import time
             try:
                 rows = await get_urls()
+                changes = []   # collect all changes this cycle
+                downs   = []   # collect all new downtime alerts
+                ups     = []   # collect all recovery alerts
+
                 for url_id, url, title, last_hash, last_text, is_up in rows:
                     try:
-                        label = title if title else url
+                        label = title if title else extract_domain(url)
                         _, new_hash, new_text = await fetch_page(session, url)
 
                         if new_hash is None:
                             fail_counts[url_id] = fail_counts.get(url_id, 0) + 1
                             if fail_counts[url_id] == 3 and is_up:
                                 await set_status(url_id, False)
-                                await bot.send_message(
-                                    ALLOWED_ID,
-                                    f"👁 mzekali lost sight of something\n\n"
-                                    f"<b>{label}</b>\n"
-                                    f"<i>{extract_domain(url)}</i>\n\n"
-                                    f"site is not responding\n\n"
-                                    f"· {now_str()} ·",
-                                    parse_mode="HTML",
-                                    reply_markup=open_site_keyboard(url),
-                                    disable_web_page_preview=True,
-                                )
+                                downs.append(f"🔴 <b>{label}</b>  <i>{extract_domain(url)}</i>")
                             continue
 
                         if not is_up:
                             await set_status(url_id, True)
-                            await bot.send_message(
-                                ALLOWED_ID,
-                                f"👁 mzekali sees it again\n\n"
-                                f"<b>{label}</b>\n"
-                                f"<i>{extract_domain(url)}</i>\n\n"
-                                f"site is back\n\n"
-                                f"· {now_str()} ·",
-                                parse_mode="HTML",
-                                reply_markup=open_site_keyboard(url),
-                                disable_web_page_preview=True,
-                            )
+                            ups.append(f"🟢 <b>{label}</b>  <i>{extract_domain(url)}</i>")
 
                         fail_counts[url_id] = 0
 
                         if last_hash is None:
                             await update_page(url_id, new_hash, "\n".join(new_text))
                         elif new_hash != last_hash:
-                            import time
                             now_ts = time.time()
                             old_text = last_text.split("\n") if last_text else []
                             diff = build_diff(old_text, new_text)
@@ -288,24 +272,44 @@ async def check_loop():
                                 continue
                             last_notified[url_id] = now_ts
 
-                            msg = (
-                                f"👁 mzekali caught something\n\n"
-                                f"<b>{label}</b>\n"
-                                f"<i>{extract_domain(url)}</i>"
-                                f" just moved\n"
-                            )
+                            entry = f"<b>{label}</b>  <i>{extract_domain(url)}</i>"
                             if diff:
-                                msg += f"\n{diff}\n"
-                            msg += f"\n· {now_str()} ·"
+                                entry += f"\n{diff}"
+                            changes.append((entry, url))
 
-                            await bot.send_message(
-                                ALLOWED_ID, msg,
-                                parse_mode="HTML",
-                                reply_markup=open_site_keyboard(url),
-                                disable_web_page_preview=True,
-                            )
                     except Exception as e:
                         logging.error(f"Error processing {url}: {e}")
+
+                # send one batched message for changes
+                if changes:
+                    if len(changes) == 1:
+                        entry, url = changes[0]
+                        msg = f"👁 mzekali caught something\n\n{entry}\n\n· {now_str()} ·"
+                        await bot.send_message(
+                            ALLOWED_ID, msg,
+                            parse_mode="HTML",
+                            reply_markup=open_site_keyboard(url),
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        lines = "\n\n".join(e for e, _ in changes)
+                        msg = f"👁 mzekali caught {len(changes)} changes\n\n{lines}\n\n· {now_str()} ·"
+                        await bot.send_message(
+                            ALLOWED_ID, msg,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+
+                # send downs
+                if downs:
+                    msg = "👁 mzekali lost sight\n\n" + "\n".join(downs) + f"\n\n· {now_str()} ·"
+                    await bot.send_message(ALLOWED_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
+
+                # send recoveries
+                if ups:
+                    msg = "👁 mzekali sees them again\n\n" + "\n".join(ups) + f"\n\n· {now_str()} ·"
+                    await bot.send_message(ALLOWED_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
+
             except Exception as e:
                 logging.error(f"check_loop error: {e}")
 
@@ -406,8 +410,7 @@ async def auto_add_url(message: types.Message):
     await status_msg.edit_text(
         f"✅ <b>Added!</b>\n\n"
         f"📄 {short_title}\n"
-        f"<code>{extract_domain(url)}</code>\n\n"
-        f"Checking every {CHECK_EVERY // 60} min.",
+        f"<code>{extract_domain(url)}</code>",
         parse_mode="HTML",
     )
 

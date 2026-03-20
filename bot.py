@@ -83,6 +83,7 @@ def main_keyboard():
 def list_view_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Manage", callback_data="manage"),
+        InlineKeyboardButton(text="🗑 Delete all", callback_data="ask_delete_all"),
     ]])
 
 def manage_keyboard(rows):
@@ -189,9 +190,10 @@ async def smart_title(session: aiohttp.ClientSession, raw_title: str, domain: st
                 "messages": [{
                     "role": "user",
                     "content": (
-                        f"Shorten this webpage title to 2-4 words max. "
-                        f"Keep the company/brand name. Be concise. "
-                        f"Return ONLY the short title, nothing else.\n\n"
+                        f"Create a short 2-4 word label for this webpage. "
+                        f"Format: [Company] [Page type]. Examples: 'Tripledot Jobs', 'Coursera Careers', 'Playkot Hiring'. "
+                        f"Use the company name from domain if title is unclear. "
+                        f"Return ONLY the label, nothing else.\n\n"
                         f"Domain: {domain}\n"
                         f"Title: {raw_title}"
                     )
@@ -336,7 +338,7 @@ async def cmd_start(message: types.Message):
         "Named after the Georgian goddess of the forest — "
         "I see everything that moves on the web.\n\n"
         "Just send me any URL and I'll start monitoring it.\n\n"
-        f"⏱ Checks every <b>{CHECK_EVERY // 60} min</b>",
+        f"⏱ Checks every <b>{CHECK_EVERY // 3600} hr</b>" if CHECK_EVERY >= 3600 else f"⏱ Checks every <b>{CHECK_EVERY // 60} min</b>",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -346,12 +348,12 @@ async def cmd_help(message: types.Message):
     if not only_me(message): return
     await message.answer(
         "📖 <b>How to use:</b>\n\n"
-        "🔗 <b>Send any URL</b> — I'll start monitoring it\n"
+        "🔗 Send any URL — I'll start monitoring it\n"
         "📋 <b>My list</b> — view all monitored sites\n"
-        "🟢 site is up  /  🔴 site is down\n"
-        "🗑 — remove a site (asks for confirmation)\n\n"
-        "I'll ping you when something changes 🔔\n"
-        "I'll show you what exactly changed ➕➖\n"
+        "🔄 <b>Check now</b> — run a check immediately\n"
+        "🗑 <b>Manage</b> — remove sites from the list\n\n"
+        "🟢 site is up  /  🔴 site is down\n\n"
+        "I'll alert you when something changes 🔔\n"
         "I'll alert you if a site goes down 🔴 or comes back 🟢",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
@@ -372,7 +374,7 @@ async def cmd_list(message: types.Message):
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
     lines = "\n\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{i}. {(r[2] or extract_domain(r[1]))[:35]}</b>\n"
+        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>\n"
         f"    <code>{extract_domain(r[1])}</code>"
         for i, r in enumerate(rows, 1)
     )
@@ -569,16 +571,42 @@ async def cancel_manage(callback: types.CallbackQuery):
     up = sum(1 for r in rows if r[5])
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    lines = "\n".join(
-        f"{'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
-        for r in rows
+    lines = "\n\n".join(
+        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>\n"
+        f"    <code>{extract_domain(r[1])}</code>"
+        for i, r in enumerate(rows, 1)
     )
     await callback.message.edit_text(
         f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
+        disable_web_page_preview=True,
     )
     await callback.answer()
+
+@dp.callback_query(F.data == "ask_delete_all")
+async def ask_delete_all(callback: types.CallbackQuery):
+    if callback.from_user.id != ALLOWED_ID: return
+    await callback.message.edit_text(
+        "🗑 <b>Delete all monitored sites?</b>\n\nThis cannot be undone.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Yes, delete all", callback_data="confirm_delete_all"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_manage"),
+        ]])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "confirm_delete_all")
+async def confirm_delete_all(callback: types.CallbackQuery):
+    if callback.from_user.id != ALLOWED_ID: return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM urls")
+        await db.commit()
+    fail_counts.clear()
+    last_notified.clear()
+    await callback.message.edit_text("🗑 All sites removed.")
+    await callback.answer("Done")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():

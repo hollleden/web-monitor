@@ -168,6 +168,42 @@ async def set_status(url_id: int, is_up: bool):
 
 # ── Fetching ──────────────────────────────────────────────────────────────────
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebMonitor/1.0)"}
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+async def smart_title(session: aiohttp.ClientSession, raw_title: str, domain: str) -> str:
+    """Ask Claude to shorten the page title to 2-4 words."""
+    if not ANTHROPIC_API_KEY:
+        return raw_title
+    try:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 20,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        f"Shorten this webpage title to 2-4 words max. "
+                        f"Keep the company/brand name. Be concise. "
+                        f"Return ONLY the short title, nothing else.\n\n"
+                        f"Domain: {domain}\n"
+                        f"Title: {raw_title}"
+                    )
+                }]
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            data = await resp.json()
+            short = data["content"][0]["text"].strip().strip('"')
+            return short if short else raw_title
+    except Exception as e:
+        logging.warning(f"smart_title error: {e}")
+        return raw_title
 
 async def fetch_page(session: aiohttp.ClientSession, url: str):
     """Returns (title, hash, text_lines) or (None, None, None) on error."""
@@ -331,8 +367,8 @@ async def cmd_list(message: types.Message):
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
     lines = "\n".join(
-        f"{'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
-        for r in rows
+        f"{'🟢' if r[5] else '🔴'} {i}. {r[2] or extract_domain(r[1])}  <code>{extract_domain(r[1])}</code>"
+        for i, r in enumerate(rows, 1)
     )
     await message.answer(
         f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
@@ -360,11 +396,15 @@ async def auto_add_url(message: types.Message):
         )
         return
 
-    await add_url(url, title, first_hash, "\n".join(first_text))
+    # smart rename via Claude
+    async with aiohttp.ClientSession() as session:
+        short_title = await smart_title(session, title, extract_domain(url))
+
+    await add_url(url, short_title, first_hash, "\n".join(first_text))
     await status_msg.edit_text(
         f"✅ <b>Added!</b>\n\n"
-        f"📄 {title}\n"
-        f"🔗 {url}\n\n"
+        f"📄 {short_title}\n"
+        f"<code>{extract_domain(url)}</code>\n\n"
         f"Checking every {CHECK_EVERY // 60} min.",
         parse_mode="HTML",
     )

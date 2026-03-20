@@ -374,8 +374,8 @@ async def cmd_list(message: types.Message):
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
     lines = "\n\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>\n"
-        f"    <code>{extract_domain(r[1])}</code>"
+        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>"
+        + (f"\n    <code>{extract_domain(r[1])}</code>" if r[2] else "")
         for i, r in enumerate(rows, 1)
     )
     await message.answer(
@@ -417,9 +417,20 @@ async def auto_add_url(message: types.Message):
         parse_mode="HTML",
     )
 
+last_manual_check: float = 0
+CHECK_NOW_COOLDOWN = 300  # 5 minutes
+
 @dp.message(F.text == "🔄 Check now")
 async def cmd_check_now(message: types.Message):
+    global last_manual_check
     if not only_me(message): return
+    import time
+    now_ts = time.time()
+    if now_ts - last_manual_check < CHECK_NOW_COOLDOWN:
+        wait = int((CHECK_NOW_COOLDOWN - (now_ts - last_manual_check)) / 60) + 1
+        await message.answer(f"⏳ Please wait ~{wait} min before checking again.")
+        return
+    last_manual_check = now_ts
     rows = await get_urls()
     if not rows:
         await message.answer("📭 Nothing to check yet.", reply_markup=main_keyboard())
@@ -572,8 +583,8 @@ async def cancel_manage(callback: types.CallbackQuery):
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
     lines = "\n\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>\n"
-        f"    <code>{extract_domain(r[1])}</code>"
+        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>"
+        + (f"\n    <code>{extract_domain(r[1])}</code>" if r[2] else "")
         for i, r in enumerate(rows, 1)
     )
     await callback.message.edit_text(

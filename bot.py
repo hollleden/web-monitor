@@ -287,7 +287,7 @@ async def check_loop():
                 if changes:
                     if len(changes) == 1:
                         entry, url = changes[0]
-                        msg = f"👁 mzekali caught something\n\n{entry}\n\n· {now_str()} ·"
+                        msg = f"✨ update from mzekali\n\n{entry}\n\n· {now_str()} ·"
                         await bot.send_message(
                             ALLOWED_ID, msg,
                             parse_mode="HTML",
@@ -296,7 +296,7 @@ async def check_loop():
                         )
                     else:
                         lines = "\n\n".join(f"• {e}" for e, _ in changes)
-                        msg = f"👁 mzekali caught {len(changes)} changes\n\n{lines}\n\n· {now_str()} ·"
+                        msg = f"✨ {len(changes)} updates\n\n{lines}\n\n· {now_str()} ·"
                         await bot.send_message(
                             ALLOWED_ID, msg,
                             parse_mode="HTML",
@@ -305,12 +305,12 @@ async def check_loop():
 
                 # send downs
                 if downs:
-                    msg = "👁 mzekali lost sight\n\n" + "\n".join(downs) + f"\n\n· {now_str()} ·"
+                    msg = "🚫 can't reach:\n\n" + "\n".join(downs) + f"\n\n· {now_str()} ·"
                     await bot.send_message(ALLOWED_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
 
                 # send recoveries
                 if ups:
-                    msg = "👁 mzekali sees them again\n\n" + "\n".join(ups) + f"\n\n· {now_str()} ·"
+                    msg = "✅ back online:\n\n" + "\n".join(ups) + f"\n\n· {now_str()} ·"
                     await bot.send_message(ALLOWED_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
 
             except Exception as e:
@@ -334,11 +334,10 @@ async def cmd_start(message: types.Message):
     #     reply_markup=main_keyboard(),
     # )
     await message.answer(
-        "🌿 <b>Mzekali is watching.</b>\n\n"
-        "Named after the Georgian goddess of the forest — "
-        "I see everything that moves on the web.\n\n"
-        "Just send me any URL and I'll start monitoring it.\n\n"
-        f"⏱ Checks every <b>{CHECK_EVERY // 3600} hr</b>" if CHECK_EVERY >= 3600 else f"⏱ Checks every <b>{CHECK_EVERY // 60} min</b>",
+        "🌙 <b>mzekali’s here.</b>\n\n"
+        "named after a georgian forest goddess, but basically i just watch websites for you.\n\n"
+        "send me a url and i’ll start monitoring.\n\n"
+        f"⏱ i check every {CHECK_EVERY // 3600} hr" if CHECK_EVERY >= 3600 else f"⏱ i check every {CHECK_EVERY // 60} min",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -347,14 +346,13 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     if not only_me(message): return
     await message.answer(
-        "📖 <b>How to use:</b>\n\n"
-        "🔗 Send any URL — I'll start monitoring it\n"
-        "📋 <b>My list</b> — view all monitored sites\n"
-        "🔄 <b>Check now</b> — run a check immediately\n"
-        "🗑 <b>Manage</b> — remove sites from the list\n\n"
-        "🟢 site is up  /  🔴 site is down\n\n"
-        "I'll alert you when something changes 🔔\n"
-        "I'll alert you if a site goes down 🔴 or comes back 🟢",
+        "💡 <b>quick guide:</b>\n\n"
+        "🔗 send any url → i’ll watch it\n"
+        "📋 <b>my list</b> → see what i’m tracking\n"
+        "🔄 <b>check now</b> → scan right now\n"
+        "🗑 <b>manage</b> → remove sites\n\n"
+        "🟢 up / 🔴 down\n\n"
+        "i’ll tell you if something changes, dies, or wakes up.",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
@@ -365,7 +363,7 @@ async def cmd_list(message: types.Message):
     rows = await get_urls()
     if not rows:
         await message.answer(
-            "📭 Your list is empty.\n\nJust send me any URL to get started.",
+            "📭 list is empty.\n\nsend me a url and i’ll keep an eye on it.",
             parse_mode="HTML",
             reply_markup=main_keyboard(),
         )
@@ -379,7 +377,7 @@ async def cmd_list(message: types.Message):
         for i, r in enumerate(rows, 1)
     )
     await message.answer(
-        f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
+        f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n{lines}",
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
         disable_web_page_preview=True,
@@ -391,16 +389,16 @@ async def auto_add_url(message: types.Message):
     url = normalize_url(message.text)
 
     if await url_exists(url):
-        await message.answer(f"👀 Already monitoring this one.\n\n🔗 {url}")
+        await message.answer(f"👀 i’m already tracking that.\n\n🔗 {url}")
         return
 
-    status_msg = await message.answer("🔍 Checking site...")
+    status_msg = await message.answer("🔍 checking site...")
     async with aiohttp.ClientSession() as session:
         title, first_hash, first_text = await fetch_page(session, url)
 
     if first_hash is None:
         await status_msg.edit_text(
-            f"❌ <b>Could not reach this site.</b>\n\n🔗 {url}\n\nCheck the URL and try again.",
+            f"❌ couldn’t reach it.\n\n🔗 {url}\n\ncheck the url and try again.",
             parse_mode="HTML",
         )
         return
@@ -411,7 +409,7 @@ async def auto_add_url(message: types.Message):
 
     await add_url(url, short_title, first_hash, "\n".join(first_text))
     await status_msg.edit_text(
-        f"✅ <b>Added!</b>\n\n"
+        f"✅ <b>got it.</b>\n\n"
         f"📄 {short_title}\n"
         f"<code>{extract_domain(url)}</code>",
         parse_mode="HTML",
@@ -428,14 +426,14 @@ async def cmd_check_now(message: types.Message):
     now_ts = time.time()
     if now_ts - last_manual_check < CHECK_NOW_COOLDOWN:
         wait = int((CHECK_NOW_COOLDOWN - (now_ts - last_manual_check)) / 60) + 1
-        await message.answer(f"⏳ Please wait ~{wait} min before checking again.")
+        await message.answer(f"⏳ hold up ~{wait} min before checking again.")
         return
     last_manual_check = now_ts
     rows = await get_urls()
     if not rows:
-        await message.answer("📭 Nothing to check yet.", reply_markup=main_keyboard())
+        await message.answer("📭 nothing here yet.", reply_markup=main_keyboard())
         return
-    status_msg = await message.answer(f"🔍 Checking {len(rows)} site(s)...")
+    status_msg = await message.answer(f"🔍 checking {len(rows)} site(s)...")
     import time
 
     changes = []
@@ -481,7 +479,7 @@ async def cmd_check_now(message: types.Message):
     parts = []
     if changes:
         lines = "\n\n".join(f"• {e}" for e, _ in changes)
-        parts.append(f"👁 {len(changes)} change(s) detected\n\n{lines}")
+        parts.append(f"✨ {len(changes)} change(s)\n\n{lines}")
     if downs:
         parts.append("site(s) down:\n" + "\n".join(downs))
     if ups:
@@ -495,7 +493,7 @@ async def cmd_check_now(message: types.Message):
         )
     else:
         await status_msg.edit_text(
-            f"✅ All {len(rows)} sites checked — nothing changed.\n\n· {now_str()} ·",
+            f"✅ done. {len(rows)} sites, nothing new.\n\n· {now_str()} ·",
             parse_mode="HTML",
         )
 
@@ -503,7 +501,7 @@ async def cmd_check_now(message: types.Message):
 async def unknown_text(message: types.Message):
     if not only_me(message): return
     await message.answer(
-        "🔗 Send me a URL to monitor it.\n\n<i>Example: https://example.com</i>",
+        "🔗 send me a url and i’ll monitor it.\n\n<i>example: https://example.com</i>",
         parse_mode="HTML",
     )
 
@@ -512,7 +510,7 @@ async def enter_manage(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
     rows = await get_urls()
     if not rows:
-        await callback.message.edit_text("📭 Nothing to remove.")
+        await callback.message.edit_text("📭 nothing to remove.")
         await callback.answer()
         return
     lines = "\n".join(
@@ -520,7 +518,7 @@ async def enter_manage(callback: types.CallbackQuery):
         for i, r in enumerate(rows, 1)
     )
     await callback.message.edit_text(
-        f"📋 <b>Select site to remove:</b>\n\n{lines}",
+        f"📋 <b>which site should i stop tracking?</b>\n\n{lines}",
         parse_mode="HTML",
         reply_markup=manage_keyboard(rows),
     )
@@ -532,13 +530,13 @@ async def pick_site(callback: types.CallbackQuery):
     idx = int(callback.data.split(":")[1])
     rows = await get_urls()
     if idx >= len(rows):
-        await callback.answer("Site not found")
+        await callback.answer("site not found")
         return
     _, url, title, *__ = rows[idx]
     label = title or extract_domain(url)
     url_key = hashlib.md5(url.encode()).hexdigest()[:12]
     await callback.message.edit_text(
-        f"🗑 Remove <b>{label}</b>?",
+        f"🗑 stop tracking <b>{label}</b>?",
         parse_mode="HTML",
         reply_markup=confirm_delete_keyboard(url_key),
     )
@@ -556,8 +554,8 @@ async def delete_url(callback: types.CallbackQuery):
             del fail_counts[k]
 
     if not rows:
-        await callback.message.edit_text("🗑 Removed. List is now empty.")
-        await callback.answer("Done")
+        await callback.message.edit_text("🗑 all sites removed.")
+        await callback.answer("done")
         return
 
     # go back to updated list
@@ -569,11 +567,11 @@ async def delete_url(callback: types.CallbackQuery):
         for r in rows
     )
     await callback.message.edit_text(
-        f"🗑 Removed.\n\n📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
+        f"🗑 removed.\n\n📋 <b>now tracking {len(rows)} site(s)</b>  {summary}\n\n{lines}",
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
     )
-    await callback.answer("Done")
+    await callback.answer("done")
 
 @dp.callback_query(F.data == "cancel_manage")
 async def cancel_manage(callback: types.CallbackQuery):
@@ -588,7 +586,7 @@ async def cancel_manage(callback: types.CallbackQuery):
         for i, r in enumerate(rows, 1)
     )
     await callback.message.edit_text(
-        f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
+        f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n{lines}",
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
         disable_web_page_preview=True,
@@ -599,7 +597,7 @@ async def cancel_manage(callback: types.CallbackQuery):
 async def ask_delete_all(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
     await callback.message.edit_text(
-        "🗑 <b>Delete all monitored sites?</b>\n\nThis cannot be undone.",
+        "🗑 <b>remove all sites?</b>\n\nthis can’t be undone.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Yes, delete all", callback_data="confirm_delete_all"),
@@ -616,8 +614,8 @@ async def confirm_delete_all(callback: types.CallbackQuery):
         await db.commit()
     fail_counts.clear()
     last_notified.clear()
-    await callback.message.edit_text("🗑 All sites removed.")
-    await callback.answer("Done")
+    await callback.message.edit_text("🗑 all sites removed.")
+    await callback.answer("done")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():

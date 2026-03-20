@@ -366,14 +366,16 @@ async def cmd_list(message: types.Message):
     up = sum(1 for r in rows if r[5])
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    lines = "\n".join(
-        f"{'🟢' if r[5] else '🔴'} {i}. {r[2] or extract_domain(r[1])}  <code>{extract_domain(r[1])}</code>"
+    lines = "\n\n".join(
+        f"{'🟢' if r[5] else '🔴'} <b>{i}. {(r[2] or extract_domain(r[1]))[:35]}</b>\n"
+        f"    <code>{extract_domain(r[1])}</code>"
         for i, r in enumerate(rows, 1)
     )
     await message.answer(
         f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
+        disable_web_page_preview=True,
     )
 
 @dp.message(F.text.startswith("http"))

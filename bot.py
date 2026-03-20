@@ -79,17 +79,11 @@ def main_keyboard():
         resize_keyboard=True,
     )
 
-def list_keyboard(rows):
-    buttons = []
-    for url_id, url, title, _, __, is_up in rows:
-        status = "🟢" if is_up else "🔴"
-        domain = extract_domain(url)
-        url_key = hashlib.md5(url.encode()).hexdigest()[:12]
-        buttons.append([
-            InlineKeyboardButton(text=f"{status} {domain}", url=url),
-            InlineKeyboardButton(text="🗑", callback_data=f"ask_del:{url_key}"),
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def site_keyboard(url_key: str, url: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🌐 Open", url=url),
+        InlineKeyboardButton(text="🗑 Remove", callback_data=f"ask_del:{url_key}"),
+    ]])
 
 def confirm_delete_keyboard(url_key: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -314,15 +308,21 @@ async def cmd_list(message: types.Message):
     up = sum(1 for r in rows if r[5])
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    titles_text = "\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{r[2] or extract_domain(r[1])}</b>\n    <i>{extract_domain(r[1])}</i>"
-        for r in rows
-    )
     await message.answer(
-        f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}\n\n{titles_text}",
+        f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}",
         parse_mode="HTML",
-        reply_markup=list_keyboard(rows),
+        reply_markup=main_keyboard(),
     )
+    for _, url, title, __, ___, is_up in rows:
+        status = "🟢" if is_up else "🔴"
+        label = title if title else url
+        domain = extract_domain(url)
+        url_key = hashlib.md5(url.encode()).hexdigest()[:12]
+        await message.answer(
+            f"{status} <b>{label}</b>\n<i>{domain}</i>",
+            parse_mode="HTML",
+            reply_markup=site_keyboard(url_key, url),
+        )
 
 @dp.message(F.text.startswith("http"))
 async def auto_add_url(message: types.Message):

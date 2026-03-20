@@ -33,6 +33,9 @@ def now_str() -> str:
     tz = timezone(timedelta(hours=TZ_OFFSET))
     return datetime.now(tz).strftime("%d %b %Y, %H:%M")
 
+def extract_domain(url: str) -> str:
+    return url.replace("https://", "").replace("http://", "").split("/")[0]
+
 def normalize_url(url: str) -> str:
     url = url.split()[0].strip()
     if url.startswith("http://"):
@@ -50,18 +53,21 @@ def html_to_text(html: str) -> list[str]:
     return lines
 
 def build_diff(old_text: list[str], new_text: list[str]) -> str:
-    """Return a short human-readable diff, max ~10 lines."""
-    added   = [l for l in new_text if l not in set(old_text)]
-    removed = [l for l in old_text if l not in set(new_text)]
+    old_set = set(old_text)
+    new_set = set(new_text)
+    added   = [l for l in new_text if l not in old_set and len(l) > 40]
+    removed = [l for l in old_text if l not in new_set and len(l) > 40]
+
+    # too many changes = dynamic page, skip diff
+    if len(added) + len(removed) > 20:
+        return ""
 
     parts = []
-    for line in added[:5]:
+    for line in added[:4]:
         parts.append(f"➕ {line[:120]}")
-    for line in removed[:5]:
+    for line in removed[:4]:
         parts.append(f"➖ {line[:120]}")
 
-    if not parts:
-        return ""
     return "\n".join(parts)
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -76,11 +82,11 @@ def main_keyboard():
 def list_keyboard(rows):
     buttons = []
     for url_id, url, title, _, __, is_up in rows:
-        label = title if title else url.replace("https://", "")[:35]
         status = "🟢" if is_up else "🔴"
+        domain = extract_domain(url)
         url_key = hashlib.md5(url.encode()).hexdigest()[:12]
         buttons.append([
-            InlineKeyboardButton(text=f"{status} {label}", url=url),
+            InlineKeyboardButton(text=f"{status} {domain}", url=url),
             InlineKeyboardButton(text="🗑", callback_data=f"ask_del:{url_key}"),
         ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -179,6 +185,8 @@ async def fetch_page(session: aiohttp.ClientSession, url: str):
 
 # ── Background checker ────────────────────────────────────────────────────────
 fail_counts: dict[int, int] = {}
+last_notified: dict[int, float] = {}
+COOLDOWN = int(os.getenv("COOLDOWN", "3600"))  # seconds, default 1 hour
 
 async def check_loop():
     await asyncio.sleep(10)
@@ -219,9 +227,16 @@ async def check_loop():
                         if last_hash is None:
                             await update_page(url_id, new_hash, "\n".join(new_text))
                         elif new_hash != last_hash:
+                            import time
+                            now_ts = time.time()
                             old_text = last_text.split("\n") if last_text else []
                             diff = build_diff(old_text, new_text)
                             await update_page(url_id, new_hash, "\n".join(new_text))
+
+                            # cooldown — don't spam if site changes constantly
+                            if now_ts - last_notified.get(url_id, 0) < COOLDOWN:
+                                continue
+                            last_notified[url_id] = now_ts
 
                             msg = (
                                 f"🔔 <b>Change detected!</b>\n\n"
@@ -299,8 +314,12 @@ async def cmd_list(message: types.Message):
     up = sum(1 for r in rows if r[5])
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
+    titles_text = "\n".join(
+        f"{'🟢' if r[5] else '🔴'} <b>{r[2] or extract_domain(r[1])}</b>\n    <i>{extract_domain(r[1])}</i>"
+        for r in rows
+    )
     await message.answer(
-        f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}",
+        f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}\n\n{titles_text}",
         parse_mode="HTML",
         reply_markup=list_keyboard(rows),
     )

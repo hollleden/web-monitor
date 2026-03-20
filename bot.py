@@ -79,16 +79,29 @@ def main_keyboard():
         resize_keyboard=True,
     )
 
-def site_keyboard(url_key: str, url: str):
+def list_view_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🌐 Open", url=url),
-        InlineKeyboardButton(text="🗑 Remove", callback_data=f"ask_del:{url_key}"),
+        InlineKeyboardButton(text="🗑 Manage", callback_data="manage"),
     ]])
+
+def manage_keyboard(rows):
+    buttons = []
+    row = []
+    for i, (url_id, url, title, _, __, is_up) in enumerate(rows, 1):
+        label = (title or extract_domain(url))[:12]
+        row.append(InlineKeyboardButton(text=f"{i}. {label}", callback_data=f"pick:{i-1}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_manage")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def confirm_delete_keyboard(url_key: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Yes, remove", callback_data=f"del:{url_key}"),
-        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_del"),
+        InlineKeyboardButton(text="❌ No", callback_data="cancel_manage"),
     ]])
 
 def open_site_keyboard(url: str):
@@ -199,10 +212,14 @@ async def check_loop():
                                 await set_status(url_id, False)
                                 await bot.send_message(
                                     ALLOWED_ID,
-                                    f"🔴 <b>Site is down!</b>\n\n"
-                                    f"📄 {label}\n🔗 {url}\n\n🕐 {now_str()}",
+                                    f"👁 mzekali lost sight of something\n\n"
+                                    f"<b>{label}</b>\n"
+                                    f"<i>{extract_domain(url)}</i>\n\n"
+                                    f"site is not responding\n\n"
+                                    f"· {now_str()} ·",
                                     parse_mode="HTML",
                                     reply_markup=open_site_keyboard(url),
+                                    disable_web_page_preview=True,
                                 )
                             continue
 
@@ -210,10 +227,14 @@ async def check_loop():
                             await set_status(url_id, True)
                             await bot.send_message(
                                 ALLOWED_ID,
-                                f"🟢 <b>Site is back up!</b>\n\n"
-                                f"📄 {label}\n🔗 {url}\n\n🕐 {now_str()}",
+                                f"👁 mzekali sees it again\n\n"
+                                f"<b>{label}</b>\n"
+                                f"<i>{extract_domain(url)}</i>\n\n"
+                                f"site is back\n\n"
+                                f"· {now_str()} ·",
                                 parse_mode="HTML",
                                 reply_markup=open_site_keyboard(url),
+                                disable_web_page_preview=True,
                             )
 
                         fail_counts[url_id] = 0
@@ -227,24 +248,25 @@ async def check_loop():
                             diff = build_diff(old_text, new_text)
                             await update_page(url_id, new_hash, "\n".join(new_text))
 
-                            # cooldown — don't spam if site changes constantly
                             if now_ts - last_notified.get(url_id, 0) < COOLDOWN:
                                 continue
                             last_notified[url_id] = now_ts
 
                             msg = (
-                                f"🔔 <b>Change detected!</b>\n\n"
-                                f"📄 {label}\n"
-                                f"🔗 {url}\n"
-                                f"🕐 {now_str()}"
+                                f"👁 mzekali caught something\n\n"
+                                f"<b>{label}</b>\n"
+                                f"<i>{extract_domain(url)}</i>"
+                                f" just moved\n"
                             )
                             if diff:
-                                msg += f"\n\n<blockquote>{diff}</blockquote>"
+                                msg += f"\n{diff}\n"
+                            msg += f"\n· {now_str()} ·"
 
                             await bot.send_message(
                                 ALLOWED_ID, msg,
                                 parse_mode="HTML",
                                 reply_markup=open_site_keyboard(url),
+                                disable_web_page_preview=True,
                             )
                     except Exception as e:
                         logging.error(f"Error processing {url}: {e}")
@@ -308,21 +330,15 @@ async def cmd_list(message: types.Message):
     up = sum(1 for r in rows if r[5])
     down = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    await message.answer(
-        f"📋 <b>Monitoring {len(rows)} site(s):</b>  {summary}",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
+    lines = "\n".join(
+        f"{'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
+        for r in rows
     )
-    for _, url, title, __, ___, is_up in rows:
-        status = "🟢" if is_up else "🔴"
-        label = title if title else url
-        domain = extract_domain(url)
-        url_key = hashlib.md5(url.encode()).hexdigest()[:12]
-        await message.answer(
-            f"{status} <b>{label}</b>\n<i>{domain}</i>",
-            parse_mode="HTML",
-            reply_markup=site_keyboard(url_key, url),
-        )
+    await message.answer(
+        f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
+        parse_mode="HTML",
+        reply_markup=list_view_keyboard(),
+    )
 
 @dp.message(F.text.startswith("http"))
 async def auto_add_url(message: types.Message):
@@ -361,12 +377,39 @@ async def unknown_text(message: types.Message):
         parse_mode="HTML",
     )
 
-@dp.callback_query(F.data.startswith("ask_del:"))
-async def ask_delete(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "manage")
+async def enter_manage(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
-    url_key = callback.data.split(":")[1]
-    await callback.message.answer(
-        "🗑 Are you sure you want to remove this site?",
+    rows = await get_urls()
+    if not rows:
+        await callback.message.edit_text("📭 Nothing to remove.")
+        await callback.answer()
+        return
+    lines = "\n".join(
+        f"{i}. {'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
+        for i, r in enumerate(rows, 1)
+    )
+    await callback.message.edit_text(
+        f"📋 <b>Select site to remove:</b>\n\n{lines}",
+        parse_mode="HTML",
+        reply_markup=manage_keyboard(rows),
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("pick:"))
+async def pick_site(callback: types.CallbackQuery):
+    if callback.from_user.id != ALLOWED_ID: return
+    idx = int(callback.data.split(":")[1])
+    rows = await get_urls()
+    if idx >= len(rows):
+        await callback.answer("Site not found")
+        return
+    _, url, title, *__ = rows[idx]
+    label = title or extract_domain(url)
+    url_key = hashlib.md5(url.encode()).hexdigest()[:12]
+    await callback.message.edit_text(
+        f"🗑 Remove <b>{label}</b>?",
+        parse_mode="HTML",
         reply_markup=confirm_delete_keyboard(url_key),
     )
     await callback.answer()
@@ -381,14 +424,43 @@ async def delete_url(callback: types.CallbackQuery):
     for k in list(fail_counts.keys()):
         if k not in valid_ids:
             del fail_counts[k]
+
+    if not rows:
+        await callback.message.edit_text("🗑 Removed. List is now empty.")
+        await callback.answer("Done")
+        return
+
+    # go back to updated list
+    up = sum(1 for r in rows if r[5])
+    down = len(rows) - up
+    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
+    lines = "\n".join(
+        f"{'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
+        for r in rows
+    )
     await callback.message.edit_text(
-        f"🗑 Removed.\n\n🔗 {removed_url}" if removed_url else "🗑 Removed."
+        f"🗑 Removed.\n\n📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
+        parse_mode="HTML",
+        reply_markup=list_view_keyboard(),
     )
     await callback.answer("Done")
 
-@dp.callback_query(F.data == "cancel_del")
-async def cancel_delete(callback: types.CallbackQuery):
-    await callback.message.edit_text("👌 Cancelled.")
+@dp.callback_query(F.data == "cancel_manage")
+async def cancel_manage(callback: types.CallbackQuery):
+    if callback.from_user.id != ALLOWED_ID: return
+    rows = await get_urls()
+    up = sum(1 for r in rows if r[5])
+    down = len(rows) - up
+    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
+    lines = "\n".join(
+        f"{'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
+        for r in rows
+    )
+    await callback.message.edit_text(
+        f"📋 <b>Monitoring {len(rows)} site(s)</b>  {summary}\n\n{lines}",
+        parse_mode="HTML",
+        reply_markup=list_view_keyboard(),
+    )
     await callback.answer()
 
 # ── Main ──────────────────────────────────────────────────────────────────────

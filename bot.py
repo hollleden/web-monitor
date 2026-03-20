@@ -75,6 +75,7 @@ def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📋 My list"), KeyboardButton(text="ℹ️ Help")],
+            [KeyboardButton(text="🔄 Check now")],
         ],
         resize_keyboard=True,
     )
@@ -292,7 +293,7 @@ async def check_loop():
                             disable_web_page_preview=True,
                         )
                     else:
-                        lines = "\n\n".join(e for e, _ in changes)
+                        lines = "\n\n".join(f"• {e}" for e, _ in changes)
                         msg = f"👁 mzekali caught {len(changes)} changes\n\n{lines}\n\n· {now_str()} ·"
                         await bot.send_message(
                             ALLOWED_ID, msg,
@@ -413,6 +414,77 @@ async def auto_add_url(message: types.Message):
         f"<code>{extract_domain(url)}</code>",
         parse_mode="HTML",
     )
+
+@dp.message(F.text == "🔄 Check now")
+async def cmd_check_now(message: types.Message):
+    if not only_me(message): return
+    rows = await get_urls()
+    if not rows:
+        await message.answer("📭 Nothing to check yet.", reply_markup=main_keyboard())
+        return
+    status_msg = await message.answer(f"🔍 Checking {len(rows)} site(s)...")
+    import time
+
+    changes = []
+    downs   = []
+    ups     = []
+
+    async with aiohttp.ClientSession() as session:
+        for url_id, url, title, last_hash, last_text, is_up in rows:
+            try:
+                label = title if title else extract_domain(url)
+                _, new_hash, new_text = await fetch_page(session, url)
+
+                if new_hash is None:
+                    fail_counts[url_id] = fail_counts.get(url_id, 0) + 1
+                    if fail_counts[url_id] == 3 and is_up:
+                        await set_status(url_id, False)
+                        downs.append(f"🔴 <b>{label}</b>  <i>{extract_domain(url)}</i>")
+                    continue
+
+                if not is_up:
+                    await set_status(url_id, True)
+                    ups.append(f"🟢 <b>{label}</b>  <i>{extract_domain(url)}</i>")
+
+                fail_counts[url_id] = 0
+
+                if last_hash is None:
+                    await update_page(url_id, new_hash, "\n".join(new_text))
+                elif new_hash != last_hash:
+                    now_ts = time.time()
+                    old_text = last_text.split("\n") if last_text else []
+                    diff = build_diff(old_text, new_text)
+                    await update_page(url_id, new_hash, "\n".join(new_text))
+                    last_notified[url_id] = now_ts
+                    entry = f"<b>{label}</b>  <i>{extract_domain(url)}</i>"
+                    if diff:
+                        entry += f"\n{diff}"
+                    changes.append((entry, url))
+
+            except Exception as e:
+                logging.error(f"check_now error for {url}: {e}")
+
+    # build result message
+    parts = []
+    if changes:
+        lines = "\n\n".join(f"• {e}" for e, _ in changes)
+        parts.append(f"👁 {len(changes)} change(s) detected\n\n{lines}")
+    if downs:
+        parts.append("site(s) down:\n" + "\n".join(downs))
+    if ups:
+        parts.append("site(s) back up:\n" + "\n".join(ups))
+
+    if parts:
+        await status_msg.edit_text(
+            "\n\n".join(parts) + f"\n\n· {now_str()} ·",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    else:
+        await status_msg.edit_text(
+            f"✅ All {len(rows)} sites checked — nothing changed.\n\n· {now_str()} ·",
+            parse_mode="HTML",
+        )
 
 @dp.message(F.text)
 async def unknown_text(message: types.Message):

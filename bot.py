@@ -1,9 +1,9 @@
 import asyncio
-import difflib
 import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
@@ -24,6 +24,8 @@ ALLOWED_ID  = int(os.environ["ALLOWED_ID"])
 CHECK_EVERY = int(os.getenv("CHECK_EVERY", "3600"))
 DB_PATH     = os.getenv("DB_PATH", "monitor.db")
 TZ_OFFSET   = int(os.getenv("TZ_OFFSET", "0"))
+COOLDOWN    = int(os.getenv("COOLDOWN", "3600"))
+WELCOME_IMG = "https://images4.imagebam.com/eb/f6/e5/ME1BIOEJ_o.png"
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -43,38 +45,31 @@ def normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 def html_to_text(html: str) -> list[str]:
-    """Strip HTML tags, scripts, styles — return clean lines of text."""
     html = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", "", html, flags=re.S)
     html = re.sub(r"<!--.*?-->", "", html, flags=re.S)
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"&[a-z]+;", " ", text)
     text = re.sub(r"\s+", " ", text)
-    lines = [l.strip() for l in text.split(".") if len(l.strip()) > 20]
-    return lines
+    return [l.strip() for l in text.split(".") if len(l.strip()) > 20]
 
 def build_diff(old_text: list[str], new_text: list[str]) -> str:
     old_set = set(old_text)
     new_set = set(new_text)
     added   = [l for l in new_text if l not in old_set and len(l) > 40]
     removed = [l for l in old_text if l not in new_set and len(l) > 40]
-
-    # too many changes = dynamic page, skip diff
     if len(added) + len(removed) > 20:
         return ""
-
-    parts = []
-    for line in added[:4]:
-        parts.append(f"➕ {line[:120]}")
-    for line in removed[:4]:
-        parts.append(f"➖ {line[:120]}")
-
+    parts = [f"➕ {l[:120]}" for l in added[:4]] + [f"➖ {l[:120]}" for l in removed[:4]]
     return "\n".join(parts)
 
-# ── Keyboards (updated style) ────────────────────────────────────────────────
+def interval_str() -> str:
+    return f"{CHECK_EVERY // 3600} hr" if CHECK_EVERY >= 3600 else f"{CHECK_EVERY // 60} min"
+
+# ── Keyboards ─────────────────────────────────────────────────────────────────
 def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📋 My list"), KeyboardButton(text="💡 Help")],
+            [KeyboardButton(text="📋 My list"), KeyboardButton(text="ℹ️ Help")],
             [KeyboardButton(text="🔄 Check now")],
         ],
         resize_keyboard=True,
@@ -103,12 +98,12 @@ def manage_keyboard(rows):
 def confirm_delete_keyboard(url_key: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Yes, remove", callback_data=f"del:{url_key}"),
-        InlineKeyboardButton(text="❌ No, keep", callback_data="cancel_manage"),
+        InlineKeyboardButton(text="❌ No", callback_data="cancel_manage"),
     ]])
 
 def open_site_keyboard(url: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🌐 Open", url=url),
+        InlineKeyboardButton(text="🌐 Open site", url=url),
     ]])
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -153,8 +148,7 @@ async def remove_url_by_key(url_key: str):
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("DELETE FROM urls WHERE id = ?", (url_id,))
                 await db.commit()
-            return True  # success
-    return False  # not found
+            return url
 
 async def update_page(url_id: int, new_hash: str, new_text: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -174,7 +168,6 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; WebMonitor/1.0)"}
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 async def smart_title(session: aiohttp.ClientSession, raw_title: str, domain: str) -> str:
-    """Ask Claude to shorten the page title to 2-4 words."""
     if not ANTHROPIC_API_KEY:
         return raw_title
     try:
@@ -210,11 +203,9 @@ async def smart_title(session: aiohttp.ClientSession, raw_title: str, domain: st
         return raw_title
 
 async def fetch_page(session: aiohttp.ClientSession, url: str):
-    """Returns (title, hash, text_lines) or (None, None, None) on error."""
     try:
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             html = await resp.text()
-            # title
             start = html.lower().find("<title>")
             end   = html.lower().find("</title>")
             title = None
@@ -222,8 +213,8 @@ async def fetch_page(session: aiohttp.ClientSession, url: str):
                 t = html[start+7:end].strip()
                 title = t[:50] if len(t) > 50 else t
             if not title:
-                title = url.replace("https://", "")[:40]
-            page_hash = hashlib.md5(html.encode()).hexdigest()
+                title = extract_domain(url)
+            page_hash  = hashlib.md5(html.encode()).hexdigest()
             text_lines = html_to_text(html)
             return title, page_hash, text_lines
     except Exception as e:
@@ -231,92 +222,101 @@ async def fetch_page(session: aiohttp.ClientSession, url: str):
         return None, None, None
 
 # ── Background checker ────────────────────────────────────────────────────────
-fail_counts: dict[int, int] = {}
+fail_counts:   dict[int, int]   = {}
 last_notified: dict[int, float] = {}
-COOLDOWN = int(os.getenv("COOLDOWN", "3600"))  # seconds, default 1 hour
+
+async def run_checks(session: aiohttp.ClientSession):
+    """Run one full check cycle. Returns (changes, downs, ups)."""
+    rows    = await get_urls()
+    changes = []
+    downs   = []
+    ups     = []
+
+    for url_id, url, title, last_hash, last_text, is_up in rows:
+        try:
+            label = title if title else extract_domain(url)
+            _, new_hash, new_text = await fetch_page(session, url)
+
+            if new_hash is None:
+                fail_counts[url_id] = fail_counts.get(url_id, 0) + 1
+                if fail_counts[url_id] == 3 and is_up:
+                    await set_status(url_id, False)
+                    downs.append(f"🔴 <b>{label}</b>  <i>{extract_domain(url)}</i>")
+                continue
+
+            if not is_up:
+                await set_status(url_id, True)
+                ups.append(f"🟢 <b>{label}</b>  <i>{extract_domain(url)}</i>")
+
+            fail_counts[url_id] = 0
+
+            if last_hash is None:
+                await update_page(url_id, new_hash, "\n".join(new_text))
+            elif new_hash != last_hash:
+                now_ts   = time.time()
+                old_text = last_text.split("\n") if last_text else []
+                diff     = build_diff(old_text, new_text)
+                await update_page(url_id, new_hash, "\n".join(new_text))
+
+                if now_ts - last_notified.get(url_id, 0) < COOLDOWN:
+                    continue
+                last_notified[url_id] = now_ts
+
+                entry = f"<b>{label}</b>\n<code>{url}</code>"
+                if diff:
+                    entry += f"\n{diff}"
+                changes.append((entry, url))
+
+        except Exception as e:
+            logging.error(f"Error processing {url}: {e}")
+
+    return changes, downs, ups
+
+async def send_results(changes, downs, ups):
+    if changes:
+        if len(changes) == 1:
+            entry, url = changes[0]
+            await bot.send_message(
+                ALLOWED_ID,
+                f"✨ update from mzekali\n\n{entry}\n\n· {now_str()} ·",
+                parse_mode="HTML",
+                reply_markup=open_site_keyboard(url),
+                disable_web_page_preview=True,
+            )
+        else:
+            lines = "\n\n".join(f"• {e}" for e, _ in changes)
+            buttons = [[InlineKeyboardButton(text=f"🌐 {(t or extract_domain(u))[:25]}", url=u)] for t, u in [(e.split("\n")[0].replace("<b>","").replace("</b>",""), u) for e, u in changes]]
+            await bot.send_message(
+                ALLOWED_ID,
+                f"✨ {len(changes)} updates\n\n{lines}\n\n· {now_str()} ·",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                disable_web_page_preview=True,
+            )
+    if downs:
+        await bot.send_message(
+            ALLOWED_ID,
+            "🚫 can't reach:\n\n" + "\n".join(downs) + f"\n\n· {now_str()} ·",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    if ups:
+        await bot.send_message(
+            ALLOWED_ID,
+            "✅ back online:\n\n" + "\n".join(ups) + f"\n\n· {now_str()} ·",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 async def check_loop():
     await asyncio.sleep(10)
     async with aiohttp.ClientSession() as session:
         while True:
-            import time
             try:
-                rows = await get_urls()
-                changes = []   # collect all changes this cycle
-                downs   = []   # collect all new downtime alerts
-                ups     = []   # collect all recovery alerts
-
-                for url_id, url, title, last_hash, last_text, is_up in rows:
-                    try:
-                        label = title if title else extract_domain(url)
-                        _, new_hash, new_text = await fetch_page(session, url)
-
-                        if new_hash is None:
-                            fail_counts[url_id] = fail_counts.get(url_id, 0) + 1
-                            if fail_counts[url_id] == 3 and is_up:
-                                await set_status(url_id, False)
-                                downs.append(f"🔴 <b>{label}</b>  <i>{extract_domain(url)}</i>")
-                            continue
-
-                        if not is_up:
-                            await set_status(url_id, True)
-                            ups.append(f"🟢 <b>{label}</b>  <i>{extract_domain(url)}</i>")
-
-                        fail_counts[url_id] = 0
-
-                        if last_hash is None:
-                            await update_page(url_id, new_hash, "\n".join(new_text))
-                        elif new_hash != last_hash:
-                            now_ts = time.time()
-                            old_text = last_text.split("\n") if last_text else []
-                            diff = build_diff(old_text, new_text)
-                            await update_page(url_id, new_hash, "\n".join(new_text))
-
-                            if now_ts - last_notified.get(url_id, 0) < COOLDOWN:
-                                continue
-                            last_notified[url_id] = now_ts
-
-                            entry = f"<b>{label}</b>  <i>{extract_domain(url)}</i>"
-                            if diff:
-                                entry += f"\n{diff}"
-                            changes.append((entry, url))
-
-                    except Exception as e:
-                        logging.error(f"Error processing {url}: {e}")
-
-                # send one batched message for changes
-                if changes:
-                    if len(changes) == 1:
-                        entry, url = changes[0]
-                        msg = f"✨ update from mzekali\n\n{entry}\n\n· {now_str()} ·"
-                        await bot.send_message(
-                            ALLOWED_ID, msg,
-                            parse_mode="HTML",
-                            reply_markup=open_site_keyboard(url),
-                            disable_web_page_preview=True,
-                        )
-                    else:
-                        lines = "\n\n".join(f"• {e}" for e, _ in changes)
-                        msg = f"✨ {len(changes)} updates\n\n{lines}\n\n· {now_str()} ·"
-                        await bot.send_message(
-                            ALLOWED_ID, msg,
-                            parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-
-                # send downs
-                if downs:
-                    msg = "🚫 can't reach:\n\n" + "\n".join(downs) + f"\n\n· {now_str()} ·"
-                    await bot.send_message(ALLOWED_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
-
-                # send recoveries
-                if ups:
-                    msg = "✅ back online:\n\n" + "\n".join(ups) + f"\n\n· {now_str()} ·"
-                    await bot.send_message(ALLOWED_ID, msg, parse_mode="HTML", disable_web_page_preview=True)
-
+                changes, downs, ups = await run_checks(session)
+                await send_results(changes, downs, ups)
             except Exception as e:
                 logging.error(f"check_loop error: {e}")
-
             await asyncio.sleep(CHECK_EVERY)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -327,36 +327,44 @@ def only_me(message: types.Message) -> bool:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if not only_me(message): return
-    # Format check frequency nicely
-    if CHECK_EVERY >= 3600:
-        hours = CHECK_EVERY // 3600
-        freq = f"⏱ i check every {hours} hour" + ("s" if hours > 1 else "")
-    else:
-        minutes = CHECK_EVERY // 60
-        freq = f"⏱ i check every {minutes} minute" + ("s" if minutes > 1 else "")
-    await message.answer(
-        f"🌙 <b>mzekali’s here.</b>\n\n"
-        "named after a georgian forest goddess, but basically i just watch websites for you.\n\n"
-        "send me a url and i’ll start monitoring.\n\n"
-        f"{freq}",
+    await message.answer_photo(
+        photo=WELCOME_IMG,
+        caption=(
+            "🌿 <b>mzekali is watching.</b>\n\n"
+            "named after a georgian forest goddess — "
+            "i see everything that moves on the web.\n\n"
+            "send me a url and i'll start monitoring it.\n\n"
+            f"⏱ i check every <b>{interval_str()}</b>"
+        ),
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
 
-@dp.message(F.text == "💡 Help")
+@dp.message(F.text == "ℹ️ Help")
 async def cmd_help(message: types.Message):
     if not only_me(message): return
     await message.answer(
         "💡 <b>quick guide:</b>\n\n"
-        "🔗 send any url → i’ll watch it\n"
-        "📋 <b>my list</b> → see what i’m tracking\n"
+        "🔗 send any url → i'll watch it\n"
+        "📋 <b>my list</b> → see what i'm tracking\n"
         "🔄 <b>check now</b> → scan right now\n"
         "🗑 <b>manage</b> → remove sites\n\n"
-        "🟢 up / 🔴 down\n\n"
-        "i’ll tell you if something changes, dies, or wakes up.",
+        "🟢 up  /  🔴 down\n\n"
+        "i'll tell you if something changes, goes down, or comes back.",
         parse_mode="HTML",
         reply_markup=main_keyboard(),
     )
+
+def build_list_text(rows) -> str:
+    up   = sum(1 for r in rows if r[5])
+    down = len(rows) - up
+    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
+    lines = "\n\n".join(
+        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>"
+        + (f"\n    <code>{extract_domain(r[1])}</code>" if r[2] else "")
+        for i, r in enumerate(rows, 1)
+    )
+    return f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n{lines}"
 
 @dp.message(F.text == "📋 My list")
 async def cmd_list(message: types.Message):
@@ -364,20 +372,12 @@ async def cmd_list(message: types.Message):
     rows = await get_urls()
     if not rows:
         await message.answer(
-            "📭 list is empty.\n\nsend me a url and i’ll keep an eye on it.",
-            parse_mode="HTML",
+            "📭 list is empty.\n\nsend me a url and i'll keep an eye on it.",
             reply_markup=main_keyboard(),
         )
         return
-    up = sum(1 for r in rows if r[5])
-    down = len(rows) - up
-    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    lines = "\n\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>"
-        for i, r in enumerate(rows, 1)
-    )
     await message.answer(
-        f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n{lines}",
+        build_list_text(rows),
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
         disable_web_page_preview=True,
@@ -389,7 +389,7 @@ async def auto_add_url(message: types.Message):
     url = normalize_url(message.text)
 
     if await url_exists(url):
-        await message.answer(f"👀 i’m already tracking that.\n\n🔗 {url}")
+        await message.answer(f"👀 i'm already tracking that.\n\n🔗 {url}")
         return
 
     status_msg = await message.answer("🔍 checking site...")
@@ -398,12 +398,11 @@ async def auto_add_url(message: types.Message):
 
     if first_hash is None:
         await status_msg.edit_text(
-            f"❌ couldn’t reach it.\n\n🔗 {url}\n\ncheck the url and try again.",
+            f"❌ couldn't reach it.\n\n🔗 {url}\n\ncheck the url and try again.",
             parse_mode="HTML",
         )
         return
 
-    # smart rename via Claude
     async with aiohttp.ClientSession() as session:
         short_title = await smart_title(session, title, extract_domain(url))
 
@@ -411,133 +410,66 @@ async def auto_add_url(message: types.Message):
     await status_msg.edit_text(
         f"✅ <b>got it.</b>\n\n"
         f"📄 {short_title}\n"
-        f"<code>{extract_domain(url)}</code>",
+        f"<code>{url}</code>",
         parse_mode="HTML",
     )
 
-# ── Check now with auto‑retry after cooldown ─────────────────────────────────
 last_manual_check: float = 0
-CHECK_NOW_COOLDOWN = 300  # 5 minutes
-pending_auto_check: bool = False
-auto_check_task: asyncio.Task | None = None
+CHECK_NOW_COOLDOWN = 300
 
-async def perform_check(message: types.Message | None = None):
-    """Run the check and optionally send a result message."""
+@dp.message(F.text == "🔄 Check now")
+async def cmd_check_now(message: types.Message):
+    global last_manual_check
+    if not only_me(message): return
+    now_ts = time.time()
+    if now_ts - last_manual_check < CHECK_NOW_COOLDOWN:
+        wait = int((CHECK_NOW_COOLDOWN - (now_ts - last_manual_check)) / 60) + 1
+        await message.answer(f"⏳ hold up ~{wait} min before checking again.")
+        return
+    last_manual_check = now_ts
+
     rows = await get_urls()
     if not rows:
-        if message:
-            await message.answer("📭 nothing here yet.", reply_markup=main_keyboard())
+        await message.answer("📭 nothing here yet.", reply_markup=main_keyboard())
         return
 
-    status_msg = None
-    if message:
-        status_msg = await message.answer(f"🔍 checking {len(rows)} site(s)...")
-
-    changes = []   # list of (entry, url)
-    downs   = []
-    ups     = []
+    status_msg = await message.answer(f"🔍 checking {len(rows)} site(s)...")
 
     async with aiohttp.ClientSession() as session:
-        for url_id, url, title, last_hash, last_text, is_up in rows:
-            try:
-                label = title if title else extract_domain(url)
-                _, new_hash, new_text = await fetch_page(session, url)
+        changes, downs, ups = await run_checks(session)
 
-                if new_hash is None:
-                    fail_counts[url_id] = fail_counts.get(url_id, 0) + 1
-                    if fail_counts[url_id] == 3 and is_up:
-                        await set_status(url_id, False)
-                        downs.append(f"🔴 <b>{label}</b>  <i>{extract_domain(url)}</i>")
-                    continue
-
-                if not is_up:
-                    await set_status(url_id, True)
-                    ups.append(f"🟢 <b>{label}</b>  <i>{extract_domain(url)}</i>")
-
-                fail_counts[url_id] = 0
-
-                if last_hash is None:
-                    await update_page(url_id, new_hash, "\n".join(new_text))
-                elif new_hash != last_hash:
-                    now_ts = time.time()
-                    old_text = last_text.split("\n") if last_text else []
-                    diff = build_diff(old_text, new_text)
-                    await update_page(url_id, new_hash, "\n".join(new_text))
-                    last_notified[url_id] = now_ts
-                    entry = f"<b>{label}</b>  <i>{extract_domain(url)}</i>"
-                    if diff:
-                        entry += f"\n{diff}"
-                    changes.append((entry, url))
-
-            except Exception as e:
-                logging.error(f"check error for {url}: {e}")
-
-    # build result message
     parts = []
     if changes:
         lines = "\n\n".join(f"• {e}" for e, _ in changes)
         parts.append(f"✨ {len(changes)} change(s)\n\n{lines}")
     if downs:
-        parts.append("site(s) down:\n" + "\n".join(downs))
+        parts.append("🚫 can't reach:\n" + "\n".join(downs))
     if ups:
-        parts.append("site(s) back up:\n" + "\n".join(ups))
+        parts.append("✅ back online:\n" + "\n".join(ups))
 
     if parts:
-        final_msg = "\n\n".join(parts) + f"\n\n· {now_str()} ·"
-        if status_msg:
-            await status_msg.edit_text(final_msg, parse_mode="HTML", disable_web_page_preview=True)
-        else:
-            # auto‑check: send result with button for first change if only one
-            if len(changes) == 1 and changes[0][1]:
-                await bot.send_message(
-                    ALLOWED_ID,
-                    final_msg,
-                    parse_mode="HTML",
-                    reply_markup=open_site_keyboard(changes[0][1]),
-                    disable_web_page_preview=True,
-                )
-            else:
-                await bot.send_message(ALLOWED_ID, final_msg, parse_mode="HTML", disable_web_page_preview=True)
+        buttons = [[InlineKeyboardButton(text=f"🌐 {url}", url=url)] for _, url in changes] if changes else None
+        await status_msg.edit_text(
+            "\n\n".join(parts) + f"\n\n· {now_str()} ·",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
+            disable_web_page_preview=True,
+        )
     else:
-        if status_msg:
-            await status_msg.edit_text(f"✅ done. {len(rows)} sites, nothing new.\n\n· {now_str()} ·", parse_mode="HTML")
-        # else auto‑check with no changes → silent
-
-async def delayed_check(delay_seconds: int):
-    """Wait and then perform an automatic check."""
-    global pending_auto_check, auto_check_task
-    await asyncio.sleep(delay_seconds)
-    pending_auto_check = False
-    auto_check_task = None
-    await perform_check(None)  # silent check with result message if changes
-
-@dp.message(F.text == "🔄 Check now")
-async def cmd_check_now(message: types.Message):
-    global last_manual_check, pending_auto_check, auto_check_task
-    if not only_me(message): return
-    import time
-    now_ts = time.time()
-    if now_ts - last_manual_check < CHECK_NOW_COOLDOWN:
-        remaining = CHECK_NOW_COOLDOWN - (now_ts - last_manual_check)
-        wait_min = int(remaining / 60) + 1
-        if not pending_auto_check:
-            pending_auto_check = True
-            auto_check_task = asyncio.create_task(delayed_check(remaining))
-            await message.answer(f"⏳ i’ll check again automatically in ~{wait_min} min. sit tight 🌿")
-        else:
-            await message.answer(f"⏳ auto‑check already scheduled. just ~{wait_min} min left. 🌿")
-        return
-    last_manual_check = now_ts
-    await perform_check(message)
+        await status_msg.edit_text(
+            f"✅ done. {len(rows)} sites checked — nothing new.\n\n· {now_str()} ·",
+            parse_mode="HTML",
+        )
 
 @dp.message(F.text)
 async def unknown_text(message: types.Message):
     if not only_me(message): return
     await message.answer(
-        "🔗 send me a url and i’ll monitor it.\n\n<i>example: https://example.com</i>",
+        "🔗 send me a url and i'll monitor it.\n\n<i>example: https://example.com</i>",
         parse_mode="HTML",
     )
 
+# ── Callbacks ─────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "manage")
 async def enter_manage(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
@@ -560,13 +492,13 @@ async def enter_manage(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("pick:"))
 async def pick_site(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
-    idx = int(callback.data.split(":")[1])
+    idx  = int(callback.data.split(":")[1])
     rows = await get_urls()
     if idx >= len(rows):
         await callback.answer("site not found")
         return
     _, url, title, *__ = rows[idx]
-    label = title or extract_domain(url)
+    label   = title or extract_domain(url)
     url_key = hashlib.md5(url.encode()).hexdigest()[:12]
     await callback.message.edit_text(
         f"🗑 stop tracking <b>{label}</b>?",
@@ -579,62 +511,29 @@ async def pick_site(callback: types.CallbackQuery):
 async def delete_url(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
     url_key = callback.data.split(":")[1]
-    success = await remove_url_by_key(url_key)
-
-    if not success:
-        await callback.answer("Site not found (maybe already removed).")
-        # refresh the list view
-        rows = await get_urls()
-        if rows:
-            await callback.message.edit_text(
-                "❓ Site not found. Here’s the updated list:",
-                parse_mode="HTML",
-                reply_markup=list_view_keyboard(),
-            )
-            await cmd_list(callback.message)  # reuse the list display
-        else:
-            await callback.message.edit_text("📭 list is empty now.")
-        return
-
+    await remove_url_by_key(url_key)
     rows = await get_urls()
     valid_ids = {r[0] for r in rows}
     for k in list(fail_counts.keys()):
         if k not in valid_ids:
             del fail_counts[k]
-
     if not rows:
         await callback.message.edit_text("🗑 all sites removed.")
-        await callback.answer("done")
-        return
-
-    # go back to updated list
-    up = sum(1 for r in rows if r[5])
-    down = len(rows) - up
-    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    lines = "\n".join(
-        f"{'🟢' if r[5] else '🔴'} {r[2] or extract_domain(r[1])}"
-        for r in rows
-    )
-    await callback.message.edit_text(
-        f"🗑 removed.\n\n📋 <b>now tracking {len(rows)} site(s)</b>  {summary}\n\n{lines}",
-        parse_mode="HTML",
-        reply_markup=list_view_keyboard(),
-    )
+    else:
+        await callback.message.edit_text(
+            build_list_text(rows),
+            parse_mode="HTML",
+            reply_markup=list_view_keyboard(),
+            disable_web_page_preview=True,
+        )
     await callback.answer("done")
 
 @dp.callback_query(F.data == "cancel_manage")
 async def cancel_manage(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
     rows = await get_urls()
-    up = sum(1 for r in rows if r[5])
-    down = len(rows) - up
-    summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    lines = "\n\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>"
-        for i, r in enumerate(rows, 1)
-    )
     await callback.message.edit_text(
-        f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n{lines}",
+        build_list_text(rows),
         parse_mode="HTML",
         reply_markup=list_view_keyboard(),
         disable_web_page_preview=True,
@@ -645,7 +544,7 @@ async def cancel_manage(callback: types.CallbackQuery):
 async def ask_delete_all(callback: types.CallbackQuery):
     if callback.from_user.id != ALLOWED_ID: return
     await callback.message.edit_text(
-        "🗑 <b>remove all sites?</b>\n\nthis can’t be undone.",
+        "🗑 <b>remove all sites?</b>\n\nthis can't be undone.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Yes, delete all", callback_data="confirm_delete_all"),

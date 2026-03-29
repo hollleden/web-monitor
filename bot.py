@@ -84,7 +84,7 @@ def list_view_keyboard():
 def manage_keyboard(rows):
     buttons = []
     row = []
-    for i, (url_id, url, title, _, __, is_up) in enumerate(rows, 1):
+    for i, (url_id, url, title, _, __, is_up, *rest) in enumerate(rows, 1):
         label = (title or extract_domain(url))[:12]
         row.append(InlineKeyboardButton(text=f"{i}. {label}", callback_data=f"pick:{i-1}"))
         if len(row) == 2:
@@ -113,19 +113,27 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS urls (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                url       TEXT UNIQUE NOT NULL,
-                title     TEXT,
-                last_hash TEXT,
-                last_text TEXT,
-                is_up     INTEGER DEFAULT 1
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                url          TEXT UNIQUE NOT NULL,
+                title        TEXT,
+                last_hash    TEXT,
+                last_text    TEXT,
+                is_up        INTEGER DEFAULT 1,
+                last_changed TEXT,
+                last_diff    TEXT
             )
         """)
+        # migrate existing DB — add columns if missing
+        for col, definition in [("last_changed", "TEXT"), ("last_diff", "TEXT")]:
+            try:
+                await db.execute(f"ALTER TABLE urls ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
         await db.commit()
 
 async def get_urls():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, url, title, last_hash, last_text, is_up FROM urls") as cur:
+        async with db.execute("SELECT id, url, title, last_hash, last_text, is_up, last_changed, last_diff FROM urls") as cur:
             return await cur.fetchall()
 
 async def url_exists(url: str) -> bool:
@@ -150,11 +158,11 @@ async def remove_url_by_key(url_key: str):
                 await db.commit()
             return url
 
-async def update_page(url_id: int, new_hash: str, new_text: str):
+async def update_page(url_id: int, new_hash: str, new_text: str, diff: str = ""):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE urls SET last_hash = ?, last_text = ?, is_up = 1 WHERE id = ?",
-            (new_hash, new_text, url_id)
+            "UPDATE urls SET last_hash = ?, last_text = ?, is_up = 1, last_changed = ?, last_diff = ? WHERE id = ?",
+            (new_hash, new_text, now_str() if diff else None, diff or None, url_id)
         )
         await db.commit()
 
@@ -232,7 +240,7 @@ async def run_checks(session: aiohttp.ClientSession):
     downs   = []
     ups     = []
 
-    for url_id, url, title, last_hash, last_text, is_up in rows:
+    for url_id, url, title, last_hash, last_text, is_up, last_changed, last_diff in rows:
         try:
             label = title if title else extract_domain(url)
             _, new_hash, new_text = await fetch_page(session, url)
@@ -256,15 +264,13 @@ async def run_checks(session: aiohttp.ClientSession):
                 now_ts   = time.time()
                 old_text = last_text.split("\n") if last_text else []
                 diff     = build_diff(old_text, new_text)
-                await update_page(url_id, new_hash, "\n".join(new_text))
+                await update_page(url_id, new_hash, "\n".join(new_text), diff)
 
                 if now_ts - last_notified.get(url_id, 0) < COOLDOWN:
                     continue
                 last_notified[url_id] = now_ts
 
-                entry = f"<a href=\"{url}\">{label}</a>"
-                if diff:
-                    entry += f"\n{diff}"
+                entry = format_site_entry(url, title, now_str(), diff)
                 changes.append((entry, url))
 
         except Exception as e:
@@ -274,23 +280,15 @@ async def run_checks(session: aiohttp.ClientSession):
 
 async def send_results(changes, downs, ups):
     if changes:
+        lines = "\n\n".join(f"• {e}" for e, _ in changes)
+        header = "✨ update" if len(changes) == 1 else f"✨ {len(changes)} updates"
+        kwargs = dict(
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         if len(changes) == 1:
-            entry, url = changes[0]
-            await bot.send_message(
-                ALLOWED_ID,
-                f"✨ update from mzekali\n\n{entry}\n\n· {now_str()} ·",
-                parse_mode="HTML",
-                reply_markup=open_site_keyboard(url),
-                disable_web_page_preview=True,
-            )
-        else:
-            lines = "\n\n".join(f"• {e}" for e, _ in changes)
-            await bot.send_message(
-                ALLOWED_ID,
-                f"✨ {len(changes)} updates\n\n{lines}\n\n· {now_str()} ·",
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            kwargs["reply_markup"] = open_site_keyboard(changes[0][1])
+        await bot.send_message(ALLOWED_ID, f"{header}\n\n{lines}\n\n· {now_str()} ·", **kwargs)
     if downs:
         await bot.send_message(
             ALLOWED_ID,
@@ -353,16 +351,27 @@ async def cmd_help(message: types.Message):
         reply_markup=main_keyboard(),
     )
 
+def format_site_entry(url: str, title: str, last_changed: str = None, last_diff: str = None) -> str:
+    """One site entry — used in both notifications and My list."""
+    label = (title or extract_domain(url))[:35]
+    line  = f"<a href=\"{url}\"><b>{label}</b></a>"
+    if last_changed:
+        line += f"\n<i>{last_changed}</i>"
+    if last_diff:
+        line += f"\n{last_diff[:300]}"
+    return line
+
 def build_list_text(rows) -> str:
-    up   = sum(1 for r in rows if r[5])
-    down = len(rows) - up
+    up      = sum(1 for r in rows if r[5])
+    down    = len(rows) - up
     summary = f"🟢 {up} up" + (f"  🔴 {down} down" if down else "")
-    lines = "\n\n".join(
-        f"{'🟢' if r[5] else '🔴'} <b>{i}. <a href=\"{r[1]}\">{(r[2] or extract_domain(r[1]))[:35]}</a></b>"
-        + (f"\n    <code>{extract_domain(r[1])}</code>" if r[2] else "")
-        for i, r in enumerate(rows, 1)
-    )
-    return f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n{lines}"
+    parts   = []
+    for i, r in enumerate(rows, 1):
+        url_id, url, title, last_hash, last_text, is_up, last_changed, last_diff = r
+        status = "🟢" if is_up else "🔴"
+        entry  = format_site_entry(url, title, last_changed, last_diff)
+        parts.append(f"{status} {i}. {entry}")
+    return f"📋 <b>{len(rows)} site(s) in my list</b>  {summary}\n\n" + "\n\n".join(parts)
 
 @dp.message(F.text == "📋 My list")
 async def cmd_list(message: types.Message):

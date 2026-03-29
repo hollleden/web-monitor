@@ -285,12 +285,10 @@ async def send_results(changes, downs, ups):
             )
         else:
             lines = "\n\n".join(f"• {e}" for e, _ in changes)
-            buttons = [[InlineKeyboardButton(text=f"🌐 {(t or extract_domain(u))[:25]}", url=u)] for t, u in [(e.split("\n")[0].replace("<b>","").replace("</b>",""), u) for e, u in changes]]
             await bot.send_message(
                 ALLOWED_ID,
                 f"✨ {len(changes)} updates\n\n{lines}\n\n· {now_str()} ·",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
                 disable_web_page_preview=True,
             )
     if downs:
@@ -448,11 +446,9 @@ async def cmd_check_now(message: types.Message):
         parts.append("✅ back online:\n" + "\n".join(ups))
 
     if parts:
-        buttons = [[InlineKeyboardButton(text=f"🌐 {url}", url=url)] for _, url in changes] if changes else None
         await status_msg.edit_text(
             "\n\n".join(parts) + f"\n\n· {now_str()} ·",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
             disable_web_page_preview=True,
         )
     else:

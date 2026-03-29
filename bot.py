@@ -262,7 +262,7 @@ async def run_checks(session: aiohttp.ClientSession):
                     continue
                 last_notified[url_id] = now_ts
 
-                entry = f"<b>{label}</b>\n<code>{url}</code>"
+                entry = f"<a href=\"{url}\">{label}</a>"
                 if diff:
                     entry += f"\n{diff}"
                 changes.append((entry, url))

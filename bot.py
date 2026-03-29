@@ -306,14 +306,21 @@ async def send_results(changes, downs, ups):
 
 async def check_loop():
     await asyncio.sleep(10)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
                 changes, downs, ups = await run_checks(session)
                 await send_results(changes, downs, ups)
-            except Exception as e:
-                logging.error(f"check_loop error: {e}")
-            await asyncio.sleep(CHECK_EVERY)
+        except Exception as e:
+            logging.error(f"check_loop error: {e}")
+
+        # sleep until next round hour
+        tz = timezone(timedelta(hours=TZ_OFFSET))
+        now_dt = datetime.now(tz)
+        next_hour = now_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        sleep_for = (next_hour - now_dt).total_seconds()
+        logging.info(f"Next check at {next_hour.strftime('%H:%M')} (in {int(sleep_for)}s)")
+        await asyncio.sleep(sleep_for)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def only_me(message: types.Message) -> bool:
